@@ -64,6 +64,7 @@ jobs:
       - name: Run heavy tests
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: bun run test:heavy
 
       # The heavy runner writes per-script logs to ~/.gbrain/audit/ on every

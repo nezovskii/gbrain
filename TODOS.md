@@ -1,5 +1,77 @@
 # TODOS
 
+## #1737 minion fair-scheduling follow-up (v0.43+)
+
+Filed during the #1737 wave (`/plan-eng-review` decision F7, codex outside-voice
+line 5 + Claude review agreeing). The wave shipped honest attempt accounting,
+cooperative abort-honoring (the daily cycle-wedge fix), and per-handler default
+timeouts. Slot reservation was deliberately deferred.
+
+- [ ] **P3 — Reserve a concurrency slot for short lanes so long jobs can't starve
+  fresh ones.** Today the worker claim loop (`src/core/minions/worker.ts` claim
+  loop) pulls from a single pool ordered by `priority, created_at` — N long
+  `subagent`/`embed-backfill`/`autopilot-cycle` jobs can occupy all slots while a
+  freshly-submitted short job waits (#1737's "fresh subagent never claimed"
+  half). **Why deferred:** now that abort is honored (this wave), a timed-out job
+  actually stops and frees its slot, so most of the observed starvation should
+  evaporate. **MEASURE FIRST:** before building reservation, confirm starvation
+  still reproduces with abort-honoring live (submit a short job alongside 3 long
+  ones at `--concurrency 3`; check it gets claimed). Reserving a slot is overfit
+  (breaks at `--concurrency 1`; can starve long work under continuous short
+  traffic), so only build it if the measurement shows a real residual problem.
+  **Shape if needed:** when all-but-one in-flight slot is held by long-lane
+  handler names, restrict the next `claim()` to non-long names via the existing
+  `name = ANY($4)` filter in `queue.ts:claim`. No new table/migration.
+## gbrain#1861 JSONB batch-insert follow-ups (v0.42+)
+
+Filed from the #1861 fix (batch inserts migrated from `unnest(${arr}::text[])` to
+`jsonb_to_recordset` to stop the "malformed array literal" crash on free-text
+context). Deliberately scoped OUT of that PR. See plan + GSTACK REVIEW REPORT at
+`~/.claude/plans/system-instruction-you-are-working-velvety-garden.md`.
+
+- [ ] **P3 — Element-isolation fallback for batch inserts.** On a non-retryable
+  batch error, retry the batch element-by-element so one bad row can't abort a
+  353K-page `extract --stale` sweep, logging the offending `(from_slug, context)`
+  instead of dying. The durable JSONB fix removed the known crash class (malformed
+  array literal) and NUL-stripping removed the other known jsonb-parse failure, so
+  there is no remaining data-dependent crash for this to catch *today* — it's
+  belt-and-suspenders against unknown future per-row failures. Wire it in
+  `addLinksBatch`/`addTimelineEntriesBatch`/`addTakesBatch` (or in `batchRetry` as
+  a post-classification fallback). Issue #1861 option 2.
+
+- [ ] **P3 — Audit remaining `unnest(${arr}::text[])` write sites.** `setPageAliases`
+  (alias_norm) and `addCodeEdges` (symbol-qualified names + `metas::jsonb[]`) still
+  bind through text-array literals. They carry normalized identifiers / symbol names,
+  not free prose, so the crash risk is far lower than calendar context — but they are
+  the same bug class and a hostile alias/symbol (or an embedded NUL) could still trip
+  them. Migrate to `jsonb_to_recordset` via the shared `batch-rows.ts` pattern if/when
+  one is observed failing, or proactively for completeness. `markPagesExtractedBatch`
+  is NOT in this set (slugs/source-ids/timestamps only — no free text).
+
+
+- [ ] **P3 — Single-source the batch INSERT SQL strings.** After #1861 the
+  links/timeline/takes `INSERT ... jsonb_to_recordset(($1::jsonb)->'rows')` SQL is
+  byte-identical between `postgres-engine.ts` and `pglite-engine.ts` (row builders already
+  hoisted to `batch-rows.ts`, but the SQL text is still duplicated). Hoist the three SQL
+  strings into exported constants in `batch-rows.ts` so a recordset column added to one
+  engine can't silently drift from the other. `test/e2e/engine-parity.test.ts` pins
+  behavior; a shared constant prevents drift at edit time. (Maintainability specialist.)
+
+- [ ] **P3 — Backfill batch-insert edge-case tests.** Edges sharing already-covered helper
+  code but lacking direct assertions: (a) `addTakesBatch` retries on an injected retryable
+  error + AbortSignal aborts (the `batchRetry` wrap is proven for links/timeline; takes
+  inherits the identical wrapper but isn't exercised directly); (b) `addTakesBatch`
+  intra-batch duplicate `(page_id,row_num)` rejects under `ON CONFLICT DO UPDATE`
+  (comment-claimed, unasserted). (Testing specialist.)
+
+- [ ] **P3 — Enforce a max batch size on the JSONB bulk inserts.** One JSONB datum
+  is not unbounded (server-side parse/memory ceiling). In-tree callers chunk well
+  under any limit (extract ~100, NER ~500), and `batch-rows.ts` documents "chunk
+  ~1-5K rows", but nothing enforces it for an external direct-engine caller passing
+  a giant batch. Consider a `BATCH_INSERT_MAX` constant + a clear throw, mirroring
+  the existing `DELETE_BATCH_SIZE` valve in `deletePages`. Deferred because no
+  in-tree caller hits it and the cap value is a judgment call. (Codex #1861 P2b.)
+
 ## v0.42.21.0 module-singleton ownership follow-ups (v0.42+)
 
 Filed from the v0.42.21.0 wave (#1404/#1471/#1619 — the dream-cycle
@@ -1756,22 +1828,18 @@ at plan time and got carved out:
 
 ## v0.40.3.0 follow-ups (v0.41+)
 
-- [ ] **v0.41+: source-scope the `sync-failures.jsonl` log so `--skip-failed` works under `--parallel > 1`.**
-  v0.40.3.0 shipped `gbrain sync --all --parallel N` as a continuous worker pool
-  with per-source DB locks. The remaining unsafe path: `recordSyncFailures()` /
-  `acknowledgeSyncFailures()` in `src/core/sync.ts` write to a brain-global JSONL
-  file at `~/.gbrain/sync-failures.jsonl` with no per-source scope. Under parallel
-  sync, source A's `--skip-failed` ack can swallow source B's failures recorded
-  while B was still running. v0.40.3.0's safe interim: refuse to combine
-  `--skip-failed` / `--retry-failed` with `--parallel > 1` (loud error, paste-ready
-  hint pointing at `--parallel 1`). The proper fix: (1) extend the JSONL row
-  schema with a `source_id` field; (2) `recordSyncFailures(failures, sourceId)`
-  stamps the field; (3) `acknowledgeSyncFailures({sourceId})` filters acks to
-  one source's rows; (4) `unacknowledgedSyncFailures({sourceId})` reads the
-  subset. Drop the v0.40.3.0 restriction once source-scoped acks are
-  deterministic. Estimate: ~1-2 days. Filed during v0.40.3.0 plan review by
-  Codex outside-voice (decision D15 → B in the eng-review plan at
-  `~/.claude/plans/system-instruction-you-are-working-fluttering-grove.md`).
+- [ ] **v0.41+: drop the `--skip-failed` / `--retry-failed` + `--parallel > 1` restriction now that the failure log is source-scoped.**
+  **Priority:** P3
+  v0.42.32.0 (#1939) landed the source-scoping infrastructure this TODO asked
+  for: `src/core/sync-failure-ledger.ts` keys every row by `(source_id, path)`,
+  `recordFailures(sourceId, …)` stamps it, `acknowledgeFailures(sourceId)` /
+  `autoSkipFailures(sourceId, …)` filter to one source, and a cross-process
+  lock + atomic temp-rename (`withLedgerLock`) makes concurrent read-modify-write
+  safe. The remaining work is just to LIFT the v0.40.3.0 interim guard at
+  `src/commands/sync.ts:3078` (`parallelEligible && (skipFailed || retryFailed)`
+  → loud refuse) after adding a test that proves source-scoped acks stay
+  deterministic under `--all --parallel N`. Estimate: ~0.5 day. Originally filed
+  during the v0.40.3.0 plan review (Codex outside-voice, decision D15 → B).
 
 - [ ] **v0.41+ (optional): extend `checkSyncFreshness` to include `embedding_coverage_pct`
   per source.** v0.40.3.0 plan originally proposed adding a NEW doctor check

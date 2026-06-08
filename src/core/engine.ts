@@ -98,7 +98,7 @@ export interface FileSpec {
 /**
  * v0.41.18.0 — shared opts for engine batch primitives that self-retry on
  * transient connection errors. Threaded through addLinksBatch /
- * addTimelineEntriesBatch / upsertChunks.
+ * addTimelineEntriesBatch / addTakesBatch / upsertChunks.
  *
  * Retry semantics: each batch primitive wraps its internal SQL in
  * `withRetry(BULK_RETRY_OPTS)` (default `{maxRetries:3, delayMs:1000,
@@ -127,10 +127,16 @@ export interface LinkBatchInput {
   link_type?: string;
   context?: string;
   /**
-   * Provenance (v0.13+). Pass 'frontmatter' for edges derived from YAML
-   * frontmatter, 'markdown' for [Name](path) refs, 'manual' for user-created.
-   * NULL means "legacy / unknown" and is only used by pre-v0.13 rows; new
-   * writes should always set this. Missing on input defaults to 'markdown'.
+   * Provenance (v0.13+; opened to kebab tags in v114 / #1941). Any lowercase
+   * kebab-case value <=64 chars is DB-valid (CHECK `^[a-z][a-z0-9]*(-[a-z0-9]+)*$`),
+   * so external derivers stamp their own tag (e.g. 'citation-graph'). The
+   * reconciliation-managed built-ins are 'markdown' ([Name](path) refs),
+   * 'frontmatter' (YAML-derived, see origin_*), 'mentions', 'wikilink-resolved';
+   * 'manual' is for user/tool-created edges. NULL = legacy/unknown (pre-v0.13).
+   * Missing on this batch input defaults to 'markdown'. NOTE: the add_link OP
+   * (not this engine method) forbids callers from passing the four managed
+   * built-ins and defaults omitted to 'manual' — internal callers use the
+   * engine directly and keep writing the managed values.
    */
   link_source?: string;
   /** For link_source='frontmatter': slug of the page whose frontmatter created this edge. */
@@ -1056,7 +1062,8 @@ export interface BrainEngine {
   }): Promise<StalePageRow[]>;
   /**
    * Stamp `links_extracted_at` for a batch of pages keyed on the unique
-   * `(slug, source_id)` pair (unnest idiom, mirrors addLinksBatch).
+   * `(slug, source_id)` pair (3-array `unnest` idiom; slugs/ids/timestamps only,
+   * so unlike the free-text batch inserts it never needed the #1861 jsonb migration).
    * Short-circuits on empty input. Called AFTER the link/timeline flush so a
    * crash mid-batch leaves pages unstamped and they re-extract next run.
    *
@@ -1136,6 +1143,16 @@ export interface BrainEngine {
    * applied to the to-page side of the join.
    */
   getBacklinks(slug: string, opts?: { sourceId?: string }): Promise<Link[]>;
+  /**
+   * v114 (#1941): distinct link_source provenances with edge counts, for
+   * `gbrain link-sources`. Source-scoped via `{sourceId?, sourceIds?}` (both
+   * forms, so federated `allowedSources` reads don't leak cross-source counts).
+   * Deterministic order `count DESC, link_source ASC NULLS LAST` for PG/PGLite
+   * parity. `link_source` may be NULL (legacy/unknown rows).
+   */
+  listLinkSources(
+    opts?: { sourceId?: string; sourceIds?: string[] },
+  ): Promise<{ link_source: string | null; count: number }[]>;
   /**
    * Fuzzy-match a display name to a page slug using pg_trgm similarity.
    * Zero embedding cost, zero LLM cost — designed for the v0.13 resolver used
@@ -1342,17 +1359,23 @@ export interface BrainEngine {
   // v0.28: Takes (typed/weighted/attributed claims) + synthesis evidence
   // ============================================================
   /**
-   * Bulk insert/upsert takes. Uses `unnest()` (Postgres) or manual `$N`
-   * placeholders (PGLite). Idempotency: ON CONFLICT (page_id, row_num) DO UPDATE
-   * — re-extract on a changed claim/weight updates the row in place.
-   * Returns the number of rows inserted OR updated.
+   * Bulk insert/upsert takes. Binds the whole batch as one JSONB document via
+   * `jsonb_to_recordset(($1::jsonb)->'rows')` through `executeRawJsonb` (#1861;
+   * free-text-safe, replaced the prior `unnest(::text[])` path). Idempotency:
+   * ON CONFLICT (page_id, row_num) DO UPDATE — re-extract on a changed
+   * claim/weight updates the row in place. Returns the number of rows inserted
+   * OR updated. Row construction + weight clamp/round + NUL-strip live in
+   * `src/core/batch-rows.ts:buildTakeRows` (shared across both engines).
+   *
+   * Wrapped in `batchRetry` like the other batch primitives, so `opts` (auditSite,
+   * AbortSignal) is honored; same no-double-wrap contract as `BatchOpts`.
    *
    * Weight outside [0, 1] is clamped server-side and surfaces a stderr
    * warning per call (`TAKES_WEIGHT_CLAMPED`). Invalid `kind` values
    * fail the whole batch via the CHECK constraint — caller is responsible
    * for parser validation upstream.
    */
-  addTakesBatch(rows: TakeBatchInput[]): Promise<number>;
+  addTakesBatch(rows: TakeBatchInput[], opts?: BatchOpts): Promise<number>;
 
   /** List takes filtered by holder/kind/active/etc. Resolves page_slug via JOIN. */
   listTakes(opts?: TakesListOpts): Promise<Take[]>;

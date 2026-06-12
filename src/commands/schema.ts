@@ -366,12 +366,24 @@ function runUse(args: string[]): void {
 }
 
 function packPathByName(name: string): string | null {
-  if (name === 'gbrain-base') {
-    // Resolve bundled YAML — try a few locations.
+  const bundled = new Set([
+    'gbrain-base',
+    'gbrain-recommended',
+    'gbrain-creator',
+    'gbrain-investor',
+    'gbrain-engineer',
+    'gbrain-everything',
+    'gbrain-base-v2',
+  ]);
+  if (bundled.has(name)) {
+    // Resolve bundled YAML — try source and compiled-binary deployment layouts.
     const here = dirname(new URL(import.meta.url).pathname);
     const candidates = [
-      join(here, '..', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
-      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
+      join(here, '..', 'core', 'schema-pack', 'base', `${name}.yaml`),
+      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
+      join(process.cwd(), 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
+      join(dirname(process.argv[1] ?? ''), '..', 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
+      join(dirname(process.execPath ?? ''), '..', 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
     ];
     for (const c of candidates) {
       if (existsSync(c)) return c;

@@ -1641,7 +1641,13 @@ async function extractStaleFromDB(
       // `page.updated_at.toISOString()` — the JS Date is ms-truncated, so the
       // µs-precision DB updated_at stayed strictly greater and the page never
       // cleared on Postgres. Stamping the exact value makes them equal.
-      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: page.updated_at_iso });
+      // Old pages also have to clear the extractor-version predicate.
+      const updatedAtMs = Date.parse(page.updated_at_iso);
+      const versionMs = Date.parse(versionTs);
+      const extractedAt = Number.isFinite(updatedAtMs) && Number.isFinite(versionMs) && updatedAtMs < versionMs
+        ? versionTs
+        : page.updated_at_iso;
+      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt });
     }
 
     // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so
